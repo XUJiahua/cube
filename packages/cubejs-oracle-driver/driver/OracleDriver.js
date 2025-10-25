@@ -155,7 +155,11 @@ class OracleDriver extends BaseDriver {
   }
 
   wrapQueryWithLimit(query) {
-    query.query = `SELECT * FROM (${query.query}) AS t WHERE ROWNUM <= ${query.limit}`;
+    const limit = Number.parseInt(String(query.limit), 10);
+    if (Number.isNaN(limit)) {
+      return;
+    }
+    query.query = `SELECT * FROM (${query.query}) t WHERE ROWNUM <= ${limit}`;
   }
 }
 

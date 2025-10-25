@@ -108,4 +108,42 @@ describe('OracleQuery', () => {
     expect(sql).toMatch(/GROUP BY\s+TRUNC/);
     expect(params).toEqual(['2024-01-01T00:00:00.000Z', '2024-12-31T23:59:59.999Z']);
   });
+
+  it('applies ROWNUM wrapping for limit only queries', async () => {
+    await compiler.compile();
+
+    const query = new OracleQuery(
+      { joinGraph, cubeEvaluator, compiler },
+      {
+        measures: ['visitors.count'],
+        rowLimit: 10
+      }
+    );
+
+    const [sql] = query.buildSqlAndParams();
+
+    expect(sql).toMatch(/SELECT \* FROM\s*\(SELECT/);
+    expect(sql).toContain('pagination_q WHERE ROWNUM <= (10)');
+    expect(sql).not.toContain('FETCH NEXT');
+  });
+
+  it('applies double-wrapped ROWNUM pagination for offset queries', async () => {
+    await compiler.compile();
+
+    const query = new OracleQuery(
+      { joinGraph, cubeEvaluator, compiler },
+      {
+        measures: ['visitors.count'],
+        rowLimit: 10,
+        offset: 5
+      }
+    );
+
+    const [sql] = query.buildSqlAndParams();
+
+    expect(sql).toContain('SELECT inner_q.*, ROWNUM "row_num__" FROM');
+    expect(sql).toContain('"row_num__" > 5');
+    expect(sql).toContain('"row_num__" <= 5 + (10)');
+    expect(sql).not.toContain('FETCH NEXT');
+  });
 });

@@ -1,3 +1,5 @@
+import { MAX_SOURCE_ROW_LIMIT } from '@cubejs-backend/shared';
+
 import { BaseQuery } from './BaseQuery';
 import { BaseFilter } from './BaseFilter';
 import { UserError } from '../compiler/UserError';
@@ -34,9 +36,7 @@ export class OracleQuery extends BaseQuery {
    * TODO replace with limitOffsetClause override
    */
   public groupByDimensionLimit() {
-    const limitClause = this.rowLimit === null ? '' : ` FETCH NEXT ${this.rowLimit && parseInt(this.rowLimit, 10) || 10000} ROWS ONLY`;
-    const offsetClause = this.offset ? ` OFFSET ${parseInt(this.offset, 10)} ROWS` : '';
-    return `${offsetClause}${limitClause}`;
+    return '';
   }
 
   /**
@@ -107,5 +107,66 @@ export class OracleQuery extends BaseQuery {
       throw new UserError(`Oracle can not work with table names that longer than 64 symbols. Consider using the 'sqlAlias' attribute in your cube and in your pre-aggregation definition for ${name}.`);
     }
     return name;
+  }
+
+  protected rowLimitSql(): string | null {
+    if (this.rowLimit == null) {
+      return null;
+    }
+    if (this.rowLimit === MAX_SOURCE_ROW_LIMIT) {
+      return this.paramAllocator.allocateParam(MAX_SOURCE_ROW_LIMIT);
+    }
+    const numeric = Number.parseInt(String(this.rowLimit), 10);
+    if (Number.isNaN(numeric)) {
+      return null;
+    }
+    return `${numeric}`;
+  }
+
+  protected offsetValue(): number | null {
+    if (this.offset == null) {
+      return null;
+    }
+    const parsed = Number.parseInt(String(this.offset), 10);
+    return Number.isNaN(parsed) ? null : parsed;
+  }
+
+  protected applyRowNumberPagination(sql: string): string {
+    const limitExpression = this.rowLimitSql();
+    const offsetValue = this.offsetValue();
+
+    if (!limitExpression && (offsetValue == null || offsetValue <= 0)) {
+      return sql;
+    }
+
+    const wrappedLimit = limitExpression ? `(${limitExpression})` : null;
+    const offsetNumber = offsetValue && offsetValue > 0 ? offsetValue : 0;
+
+    if (offsetNumber === 0 && wrappedLimit) {
+      return `SELECT * FROM (${sql}) pagination_q WHERE ROWNUM <= ${wrappedLimit}`;
+    }
+
+    const rowNumAlias = this.escapeColumnName('row_num__');
+    const upperBoundExpr = wrappedLimit
+      ? (offsetNumber > 0 ? `${offsetNumber} + ${wrappedLimit}` : wrappedLimit)
+      : null;
+    const innerWhere = upperBoundExpr ? ` WHERE ROWNUM <= ${upperBoundExpr}` : '';
+
+    const conditions: string[] = [];
+    if (offsetNumber > 0) {
+      conditions.push(`${rowNumAlias} > ${offsetNumber}`);
+    }
+    if (upperBoundExpr) {
+      conditions.push(`${rowNumAlias} <= ${upperBoundExpr}`);
+    }
+
+    const outerWhere = conditions.length ? ` WHERE ${conditions.join(' AND ')}` : '';
+
+    return `SELECT * FROM (SELECT inner_q.*, ROWNUM ${rowNumAlias} FROM (${sql}) inner_q${innerWhere}) outer_q${outerWhere}`;
+  }
+
+  public buildParamAnnotatedSql(): string {
+    const sql = super.buildParamAnnotatedSql();
+    return this.applyRowNumberPagination(sql);
   }
 }
