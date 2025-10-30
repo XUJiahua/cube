@@ -578,6 +578,18 @@ const variables: Record<string, (...args: any) => any> = {
   ),
 
   /**
+   * Oracle database version override.
+   * Format: "major.minor" or "major.minor.release" (e.g., "11.2", "12.1", "12.2", "19.0")
+   */
+  oracleVersion: ({
+    dataSource,
+  }: {
+    dataSource: string,
+  }) => (
+    process.env[keyByDataSource('CUBEJS_DB_ORACLE_VERSION', dataSource)]
+  ),
+
+  /**
    * Max polling interval. Currently used in BigQuery and Databricks.
    * TODO: clarify this env.
    */

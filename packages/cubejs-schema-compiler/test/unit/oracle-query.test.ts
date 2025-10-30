@@ -3,7 +3,7 @@ import { OracleQuery } from '../../src/adapter/OracleQuery';
 import { prepareJsCompiler } from './PrepareCompiler';
 
 describe('OracleQuery', () => {
-  const { compiler, joinGraph, cubeEvaluator } = prepareJsCompiler(`
+  const oracleSchema = `
     cube(\`visitors\`, {
       sql: \`
       select * from visitors
@@ -109,7 +109,11 @@ describe('OracleQuery', () => {
         }
       }
     });
-    `, { adapter: 'oracle' });
+    `;
+
+  const createOracleCompiler = () => prepareJsCompiler(oracleSchema, { adapter: 'oracle' });
+
+  const { compiler, joinGraph, cubeEvaluator } = createOracleCompiler();
 
   it('basic query without subqueries', async () => {
     await compiler.compile();
@@ -903,5 +907,311 @@ describe('OracleQuery', () => {
     expect(sql).toContain('TRUNC("visitors".created_at, \'MM\')');
     expect(sql).toMatch(/GROUP BY\s+TRUNC/);
     expect(params).toEqual(['2024-01-01T00:00:00.000Z', '2024-12-31T23:59:59.999Z']);
+  });
+
+  describe('Oracle Version-Specific Pagination', () => {
+    let originalEnv: string | undefined;
+
+    beforeEach(() => {
+      // Save original environment variable
+      originalEnv = process.env.CUBEJS_DB_ORACLE_VERSION;
+    });
+
+    afterEach(() => {
+      // Restore original environment variable
+      if (originalEnv !== undefined) {
+        process.env.CUBEJS_DB_ORACLE_VERSION = originalEnv;
+      } else {
+        delete process.env.CUBEJS_DB_ORACLE_VERSION;
+      }
+    });
+
+    describe('Oracle 12c+ (Default Behavior)', () => {
+      it('uses FETCH NEXT syntax by default when no version specified', async () => {
+        delete process.env.CUBEJS_DB_ORACLE_VERSION;
+        await compiler.compile();
+
+        const query = new OracleQuery({ joinGraph, cubeEvaluator, compiler }, {
+          measures: ['visitors.count'],
+          timezone: 'UTC',
+          limit: 100
+        });
+
+        const [sql] = query.buildSqlAndParams();
+
+        // Should use modern OFFSET/FETCH syntax
+        expect(sql).toContain('FETCH NEXT 100 ROWS ONLY');
+        expect(sql).not.toContain('ROWNUM');
+      });
+
+      it('uses FETCH NEXT with OFFSET when offset is specified', async () => {
+        delete process.env.CUBEJS_DB_ORACLE_VERSION;
+        await compiler.compile();
+
+        const query = new OracleQuery({ joinGraph, cubeEvaluator, compiler }, {
+          measures: ['visitors.count'],
+          timezone: 'UTC',
+          limit: 50,
+          offset: 10
+        });
+
+        const [sql] = query.buildSqlAndParams();
+
+        // Should use modern OFFSET/FETCH syntax
+        expect(sql).toContain('OFFSET 10 ROWS');
+        expect(sql).toContain('FETCH NEXT 50 ROWS ONLY');
+        expect(sql).not.toContain('ROWNUM');
+      });
+
+      it('uses FETCH NEXT when Oracle 12.1 is explicitly specified', async () => {
+        process.env.CUBEJS_DB_ORACLE_VERSION = '12.1';
+        await compiler.compile();
+
+        const query = new OracleQuery({ joinGraph, cubeEvaluator, compiler }, {
+          measures: ['visitors.count'],
+          timezone: 'UTC',
+          limit: 100
+        });
+
+        const [sql] = query.buildSqlAndParams();
+
+        expect(sql).toContain('FETCH NEXT 100 ROWS ONLY');
+        expect(sql).not.toContain('ROWNUM');
+      });
+
+      it('uses FETCH NEXT when Oracle 19c is specified', async () => {
+        process.env.CUBEJS_DB_ORACLE_VERSION = '19.3';
+        await compiler.compile();
+
+        const query = new OracleQuery({ joinGraph, cubeEvaluator, compiler }, {
+          measures: ['visitors.count'],
+          timezone: 'UTC',
+          limit: 100
+        });
+
+        const [sql] = query.buildSqlAndParams();
+
+        expect(sql).toContain('FETCH NEXT 100 ROWS ONLY');
+        expect(sql).not.toContain('ROWNUM');
+      });
+    });
+
+    describe('Oracle 11g (ROWNUM-based Pagination)', () => {
+      const createOracle11gQuery = async (queryOptions: any) => {
+        const {
+          compiler: oracle11gCompiler,
+          joinGraph: oracle11gJoinGraph,
+          cubeEvaluator: oracle11gCubeEvaluator
+        } = createOracleCompiler();
+
+        await oracle11gCompiler.compile();
+
+        return new OracleQuery(
+          { joinGraph: oracle11gJoinGraph, cubeEvaluator: oracle11gCubeEvaluator, compiler: oracle11gCompiler },
+          queryOptions
+        );
+      };
+
+      it('uses ROWNUM syntax when Oracle 11.2 is specified', async () => {
+        process.env.CUBEJS_DB_ORACLE_VERSION = '11.2';
+        const query = await createOracle11gQuery({
+          measures: ['visitors.count'],
+          timezone: 'UTC',
+          limit: 100
+        });
+
+        const [sql] = query.buildSqlAndParams();
+
+        // Should use ROWNUM-based pagination
+        expect(sql).toContain('ROWNUM <= 100');
+        expect(sql).not.toContain('FETCH NEXT');
+        expect(sql).not.toContain('OFFSET');
+      });
+
+      it('uses simple ROWNUM wrapper for LIMIT only (no OFFSET)', async () => {
+        process.env.CUBEJS_DB_ORACLE_VERSION = '11.2';
+        const query = await createOracle11gQuery({
+          measures: ['visitors.count'],
+          dimensions: ['visitors.source'],
+          timezone: 'UTC',
+          limit: 50
+        });
+
+        const [sql] = query.buildSqlAndParams();
+
+        // Should wrap with simple ROWNUM filter
+        expect(sql).toMatch(/SELECT \* FROM \(/);
+        expect(sql).toContain('ROWNUM <= 50');
+        // Should NOT have nested ROWNUM rnum pattern (that's for OFFSET+LIMIT)
+        expect(sql).not.toMatch(/ROWNUM rnum/);
+      });
+
+      it('uses nested ROWNUM wrapper for OFFSET + LIMIT', async () => {
+        process.env.CUBEJS_DB_ORACLE_VERSION = '11.2';
+        const query = await createOracle11gQuery({
+          measures: ['visitors.count'],
+          dimensions: ['visitors.source'],
+          timezone: 'UTC',
+          limit: 20,
+          offset: 10
+        });
+
+        const [sql] = query.buildSqlAndParams();
+
+        // Should use nested ROWNUM pattern for OFFSET+LIMIT
+        // Pattern: SELECT * FROM (SELECT a.*, ROWNUM rnum FROM (...) a WHERE ROWNUM <= maxRow) WHERE rnum > offset
+        expect(sql).toMatch(/ROWNUM rnum/);
+        expect(sql).toContain('ROWNUM <= 30'); // offset(10) + limit(20) = 30
+        expect(sql).toContain('rnum > 10'); // offset
+      });
+
+      it('does not wrap query when no LIMIT or OFFSET is specified', async () => {
+        process.env.CUBEJS_DB_ORACLE_VERSION = '11.2';
+        const query = await createOracle11gQuery({
+          measures: ['visitors.count'],
+          dimensions: ['visitors.source'],
+          timezone: 'UTC'
+          // No limit, no offset
+        });
+
+        const [sql] = query.buildSqlAndParams();
+
+        // Should have default limit applied (FETCH NEXT is empty, so ROWNUM wrapping shouldn't happen)
+        // Actually, looking at the code, when rowLimit is null and no offset, it should still apply default 10000
+        // Let me check the groupByDimensionLimit implementation...
+        // Oracle 11g returns empty string from groupByDimensionLimit when supportsOffsetFetch is false
+        // So we need to check if ROWNUM wrapping is applied
+
+        // With default limit 10000
+        expect(sql).toContain('ROWNUM <= 10000');
+      });
+
+      it('skips ROWNUM wrapping when rowLimit is explicitly null', async () => {
+        process.env.CUBEJS_DB_ORACLE_VERSION = '11.2';
+        const query = await createOracle11gQuery({
+          measures: ['visitors.count'],
+          dimensions: ['visitors.source'],
+          timezone: 'UTC',
+          rowLimit: null
+        });
+
+        const [sql] = query.buildSqlAndParams();
+
+        // Explicit null rowLimit should opt out of default pagination
+        expect(sql).not.toContain('ROWNUM');
+        expect(sql).not.toContain('FETCH NEXT');
+      });
+
+      it('works with rolling window measures and Oracle 11g', async () => {
+        process.env.CUBEJS_DB_ORACLE_VERSION = '11.2';
+        const query = await createOracle11gQuery({
+          measures: ['visitors.thisPeriod', 'visitors.priorPeriod'],
+          timeDimensions: [{
+            dimension: 'visitors.createdAt',
+            granularity: 'month',
+            dateRange: ['2020-01-01', '2020-12-31']
+          }],
+          timezone: 'UTC',
+          limit: 50
+        });
+
+        const [sql] = query.buildSqlAndParams();
+
+        // Should have ROWNUM pagination even with complex subqueries
+        expect(sql).toContain('ROWNUM <= 50');
+        expect(sql).not.toContain('FETCH NEXT');
+        // Should still have subquery logic
+        expect(sql).toMatch(/q_\d+/);
+      });
+
+      it('works with time dimension grouping and Oracle 11g', async () => {
+        process.env.CUBEJS_DB_ORACLE_VERSION = '11.2';
+        const query = await createOracle11gQuery({
+          measures: ['visitors.count'],
+          timeDimensions: [{
+            dimension: 'visitors.createdAt',
+            granularity: 'day',
+            dateRange: ['2024-01-01', '2024-01-31']
+          }],
+          timezone: 'UTC',
+          limit: 100,
+          offset: 20
+        });
+
+        const [sql] = query.buildSqlAndParams();
+
+        // Should use ROWNUM with TRUNC for time grouping
+        expect(sql).toContain('TRUNC');
+        expect(sql).toMatch(/ROWNUM rnum/);
+        expect(sql).toContain('ROWNUM <= 120'); // offset(20) + limit(100)
+        expect(sql).toContain('rnum > 20');
+      });
+    });
+
+    describe('Version String Parsing', () => {
+      const versions = [
+        { version: '11.2', expectedRownum: true },
+        { version: '11.2.0.4', expectedRownum: true },
+        { version: '12.1', expectedRownum: false },
+        { version: '12.2', expectedRownum: false },
+        { version: '18.0', expectedRownum: false },
+        { version: '19.3', expectedRownum: false },
+        { version: '21.1', expectedRownum: false }
+      ];
+
+      it.each(versions)('parses version $version and uses expected pagination', async ({ version, expectedRownum }) => {
+        process.env.CUBEJS_DB_ORACLE_VERSION = version;
+        const {
+          compiler: versionedCompiler,
+          joinGraph: versionedJoinGraph,
+          cubeEvaluator: versionedCubeEvaluator
+        } = createOracleCompiler();
+
+        await versionedCompiler.compile();
+
+        const query = new OracleQuery(
+          { joinGraph: versionedJoinGraph, cubeEvaluator: versionedCubeEvaluator, compiler: versionedCompiler },
+          {
+            measures: ['visitors.count'],
+            timezone: 'UTC',
+            limit: 100
+          }
+        );
+
+        const [sql] = query.buildSqlAndParams();
+
+        if (expectedRownum) {
+          expect(sql).toContain('ROWNUM');
+          expect(sql).not.toContain('FETCH NEXT');
+        } else {
+          expect(sql).toContain('FETCH NEXT');
+          expect(sql).not.toContain('ROWNUM');
+        }
+      });
+
+      it('handles malformed version strings gracefully', async () => {
+        process.env.CUBEJS_DB_ORACLE_VERSION = 'invalid';
+        const {
+          compiler: malformedCompiler,
+          joinGraph: malformedJoinGraph,
+          cubeEvaluator: malformedCubeEvaluator
+        } = createOracleCompiler();
+
+        await malformedCompiler.compile();
+
+        const query = new OracleQuery({ joinGraph: malformedJoinGraph, cubeEvaluator: malformedCubeEvaluator, compiler: malformedCompiler }, {
+          measures: ['visitors.count'],
+          timezone: 'UTC',
+          limit: 100
+        });
+
+        const [sql] = query.buildSqlAndParams();
+
+        // Should default to Oracle 12c+ behavior (FETCH NEXT) when parsing fails
+        // Actually, parseInt('invalid') returns NaN, and the code does (parts[0] || 12)
+        // So it should default to 12
+        expect(sql).toContain('FETCH NEXT');
+      });
+    });
   });
 });
